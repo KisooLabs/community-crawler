@@ -37,27 +37,81 @@ class TrendService:
         overlap = len(words1 & words2)
         return overlap >= TrendService.MIN_OVERLAP_WORDS
 
-    def find_or_create_trend(self, image_phash: str, title: str) -> Trend:
-        """유사한 트렌드 찾기 또는 새로 생성"""
-        cutoff = datetime.utcnow() - timedelta(hours=self.MATCH_WINDOW_HOURS)
+    @staticmethod
+    def hamming(phash1: str, phash2: str) -> int:
+        """64비트 pHash(16진 문자열) 해밍 거리. SQL의 bit_count(a # b)와 같은 값."""
+        return (int(phash1, 16) ^ int(phash2, 16)).bit_count()
 
-        # DB에서 해밍 거리 직접 계산 → 매칭되는 이미지만 반환 (egress 절감)
+    def find_trend_candidates(self, phashes: list[str]) -> dict[str, list[tuple[int, str]]]:
+        """최근 7일 이미지 중 각 입력 phash와 HASH_THRESHOLD 이내인 트렌드를 한 번에 조회.
+
+        Returns: {input_phash: [(trend_id, trend_title), ...]} (후보가 없는 phash는 키가 없다).
+        제목 유사도는 여기서 보지 않는다 (find_or_create_trend가 판정).
+
+        크롤 배치(사이트 1회분)당 1회 호출한다. 글마다 7일치를 훑던 때는 크롤 1회에
+        새 글 수(~150)만큼 창 전체를 다시 읽었다 (2026-09-14 Supabase Disk IO 후속).
+        비트열은 CTE에서 한 번만 변환하고, trends는 hits 행에 대해서만 조회한다. JOIN으로 쓰면
+        플래너가 trends 전체(22만 행)를 해시 조인하고 temp로 넘친다 (2026-09-14 EXPLAIN).
+        """
+        phashes = sorted(set(p for p in phashes if p))
+        if not phashes:
+            return {}
+        cutoff = datetime.utcnow() - timedelta(hours=self.MATCH_WINDOW_HOURS)
         rows = self.db.execute(
             text("""
-                SELECT ti.id, ti.trend_id, ti.phash, t.title AS trend_title
-                FROM trend_images ti
-                JOIN trends t ON t.id = ti.trend_id
-                WHERE ti.phash IS NOT NULL
-                  AND ti.created_at > :cutoff
-                  AND bit_count(('x' || ti.phash)::bit(64) # ('x' || :input_phash)::bit(64)) <= :threshold
+                WITH inputs AS MATERIALIZED (
+                    SELECT phash, ('x' || phash)::bit(64) AS bits
+                    FROM unnest(CAST(:phashes AS text[])) AS p(phash)
+                ),
+                win AS MATERIALIZED (
+                    SELECT trend_id, phash, ('x' || phash)::bit(64) AS bits
+                    FROM trend_images
+                    WHERE phash IS NOT NULL AND created_at > :cutoff
+                ),
+                hits AS MATERIALIZED (
+                    SELECT i.phash AS input_phash, w.trend_id
+                    FROM inputs i JOIN win w ON bit_count(i.bits # w.bits) <= :threshold
+                )
+                SELECT h.input_phash, h.trend_id,
+                       (SELECT t.title FROM trends t WHERE t.id = h.trend_id) AS trend_title
+                FROM hits h
             """),
-            {"cutoff": cutoff, "input_phash": image_phash,
+            {"phashes": phashes, "cutoff": cutoff,
              "threshold": ImageService.HASH_THRESHOLD},
         ).all()
 
+        candidates: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        seen: set[tuple[str, int]] = set()
         for row in rows:
-            if self._title_similar(title, row.trend_title):
-                trend = self.db.get(Trend, row.trend_id)
+            if row.trend_title is None or (row.input_phash, row.trend_id) in seen:
+                continue
+            seen.add((row.input_phash, row.trend_id))
+            candidates[row.input_phash].append((row.trend_id, row.trend_title))
+        return dict(candidates)
+
+    def start_match_batch(self, phashes: list[str]) -> "TrendMatchBatch":
+        """크롤 배치의 트렌드 매칭 후보를 1회 조회해 TrendMatchBatch로 돌려준다."""
+        return TrendMatchBatch(self.find_trend_candidates(phashes))
+
+    def find_or_create_trend(
+        self,
+        image_phash: str,
+        title: str,
+        batch: "TrendMatchBatch | None" = None,
+    ) -> Trend:
+        """유사한 트렌드 찾기 또는 새로 생성.
+
+        batch가 있으면 그 후보만 본다 (사이트당 1회 조회분 + 같은 배치에서 먼저 저장된 글).
+        없으면 이 phash 하나로 조회한다 (단건 호출용).
+        """
+        if batch is not None:
+            candidates = batch.candidates(image_phash)
+        else:
+            candidates = self.find_trend_candidates([image_phash]).get(image_phash, [])
+
+        for trend_id, trend_title in candidates:
+            if self._title_similar(title, trend_title):
+                trend = self.db.get(Trend, trend_id)
                 if trend:
                     return trend
 
@@ -300,3 +354,35 @@ class TrendService:
 
         self.db.commit()
         return len(trends)
+
+
+class TrendMatchBatch:
+    """크롤 배치(사이트 1회분)의 트렌드 매칭 후보.
+
+    TrendService.find_trend_candidates가 돌려준 dict에, 이 배치에서 저장이 끝난 글의
+    이미지를 record()로 더한다. 글 단위로 조회하던 때는 앞 글이 커밋된 뒤라 그 이미지도
+    창에 보였으므로, 같은 배치 안의 매칭(같은 사이트 재게시 → 같은 트렌드로 묶여
+    add_article_to_trend가 스킵)을 그대로 유지하기 위한 것이다.
+    """
+
+    def __init__(self, db_candidates: dict[str, list[tuple[int, str]]]):
+        self._db = db_candidates
+        self._saved: list[tuple[str, int, str]] = []  # (phash, trend_id, trend_title)
+
+    def candidates(self, phash: str) -> list[tuple[int, str]]:
+        """이 phash의 후보 [(trend_id, trend_title), ...]. DB 조회분 뒤에 배치 내 저장분."""
+        found = list(self._db.get(phash, []))
+        seen = {trend_id for trend_id, _ in found}
+        for saved_phash, trend_id, trend_title in self._saved:
+            if trend_id in seen:
+                continue
+            if TrendService.hamming(phash, saved_phash) <= ImageService.HASH_THRESHOLD:
+                found.append((trend_id, trend_title))
+                seen.add(trend_id)
+        return found
+
+    def record(self, trend_id: int, trend_title: str, phashes: list[str]) -> None:
+        """저장이 끝난 글의 이미지 phash들을 그 트렌드 후보로 등록."""
+        for phash in phashes:
+            if phash:
+                self._saved.append((phash, trend_id, trend_title))

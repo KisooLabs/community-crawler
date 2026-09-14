@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.models.trend import Site, TrendArticle
-from app.services.trend_service import TrendService
+from app.services.trend_service import TrendService, TrendMatchBatch
 from app.services.image_service import ImageService
 from crawlers.theqoo import TheqooCrawler
 from crawlers.ruliweb import RuliwebCrawler
@@ -179,13 +179,19 @@ class CrawlerService:
             new_articles = [a for a in articles if a.url not in existing_urls]
             logger.info(f"[{site_name}] {len(articles)} found, {len(new_articles)} new, {len(existing_urls)} skipped (already in DB)")
 
-            # 2단계: DB 저장
+            # 2단계: 트렌드 매칭 후보를 사이트당 1회 조회 (글마다 7일치 pHash 창을 훑던 것을
+            # 대체, 2026-09-14). 저장은 이 후보 dict만 본다.
+            match_batch = self.trend_service.start_match_batch([
+                self._first_phash(image_results.get(a.url)) for a in new_articles
+            ])
+
+            # 3단계: DB 저장
             processed = 0
             skipped = 0
             for article_data in new_articles:
                 try:
                     image_result = image_results.get(article_data.url)
-                    result = self._save_article(article_data, site, image_result)
+                    result = self._save_article(article_data, site, image_result, match_batch)
                     if result:
                         self.db.commit()
                         processed += 1
@@ -301,24 +307,37 @@ class CrawlerService:
 
         return results
 
-    def _save_article(self, article_data, site: Site, image_results: list | None) -> bool:
-        """글 DB 저장 (이미지/비디오 결과가 이미 있는 상태)."""
+    @staticmethod
+    def _first_phash(image_results: list | None) -> str | None:
+        """트렌드 매칭에 쓰는 첫 번째 이미지(비디오 아닌)의 pHash."""
+        for r in image_results or []:
+            if r.get("phash"):
+                return r["phash"]
+        return None
+
+    def _save_article(
+        self,
+        article_data,
+        site: Site,
+        image_results: list | None,
+        match_batch: TrendMatchBatch | None = None,
+    ) -> bool:
+        """글 DB 저장 (이미지/비디오 결과가 이미 있는 상태).
+
+        match_batch: crawl_site가 사이트당 1회 조회한 트렌드 매칭 후보. None이면 이 글의
+        phash 하나로 조회한다.
+        """
         if not image_results:
             return False
 
-        # 첫 번째 이미지(비디오 아닌)의 pHash로 트렌드 매칭
-        first_phash = None
-        for r in image_results:
-            if r.get("phash"):
-                first_phash = r["phash"]
-                break
-
+        first_phash = self._first_phash(image_results)
         if not first_phash:
             return False
 
         trend = self.trend_service.find_or_create_trend(
             first_phash,
             article_data.title,
+            match_batch,
         )
 
         article = self.trend_service.add_article_to_trend(
@@ -393,4 +412,7 @@ class CrawlerService:
         self.db.flush()
         self.db.refresh(trend)
         self.trend_service.update_trend_stats(trend)
+        if match_batch is not None:
+            # 뒤 글이 이 글과 같은 트렌드로 묶이게 (글 단위 조회 때는 커밋 뒤라 창에 보였다)
+            match_batch.record(trend.id, trend.title, [r.get("phash") for r in image_results])
         return True
