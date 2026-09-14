@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, ForeignKey, Index, text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -60,6 +60,13 @@ class TrendImage(Base):
     __table_args__ = (
         Index("idx_trend_images_phash", "phash"),
         Index("idx_trend_images_trend_id", "trend_id"),
+        # Partial index for find_or_create_trend's 7-day pHash window. Without it every
+        # new article seq-scanned the whole table (2026-09-14 Supabase Disk IO incident).
+        Index(
+            "idx_trend_images_created_at_phash",
+            "created_at",
+            postgresql_where=text("phash IS NOT NULL"),
+        ),
     )
 
 
@@ -87,4 +94,7 @@ class TrendArticle(Base):
         Index("idx_trend_articles_site_id", "site_id"),
         # DB-level guard: one article per site per trend
         Index("uq_trend_articles_trend_site", "trend_id", "site_id", unique=True),
+        # URL dedup lookups (url IN (...)) and the per-site skip-URL query (2026-09-14)
+        Index("idx_trend_articles_url", "url"),
+        Index("idx_trend_articles_site_created", "site_id", "created_at"),
     )
