@@ -1,4 +1,4 @@
-sqlalchemy
+sqlalchemy>=2.0.25,<2.1
 pydantic
 pydantic-settings
 python-dotenv
