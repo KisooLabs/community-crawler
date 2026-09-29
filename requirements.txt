@@ -11,3 +11,4 @@ psycopg2-binary
 asyncpg
 greenlet
 boto3
+psycopg[binary]
